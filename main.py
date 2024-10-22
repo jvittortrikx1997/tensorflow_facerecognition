@@ -1,137 +1,230 @@
 import os
 import numpy as np
-import pandas as pd
 import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
-from sklearn.metrics import roc_auc_score, accuracy_score
+from keras import backend as K
 import matplotlib.pyplot as plt
 import mysql.connector
 from datetime import datetime
-import cv2
+from sklearn.model_selection import train_test_split
 
-directory_a = r"C:\Users\vitor\PycharmProjects\tensorflow_facerecognition\Solicitantes"
-directory_b = r"C:\Users\vitor\PycharmProjects\face_recognition\blacklist"
+dir_A = r"C:\Users\vitor\PycharmProjects\tensorflow_facerecognition\Solicitantes"
+dir_B = r"C:\Users\vitor\PycharmProjects\tensorflow_facerecognition\blacklist"
 
 db_config = {
     'user': 'root',
     'password': '040498',
     'host': '127.0.0.1',
-    'port': 3306,
-    'database': 'face_recognition'
+    'database': 'face_recognition',
+    'port': 3306
 }
 
-tf.keras.backend.clear_session()
+def connect_db():
+    return mysql.connector.connect(**db_config)
 
-def load_images(directory):
-    images = []
-    labels = []
-    for filename in os.listdir(directory):
-        if filename.endswith('.jpg'):
-            img_path = os.path.join(directory, filename)
-            img = cv2.imread(img_path)
-            img = cv2.resize(img, (128, 128))
-            images.append(img)
-            labels.append(filename)
-    return np.array(images), np.array(labels)
+def get_pesid(image_name):
+    connection = connect_db()
+    cursor = connection.cursor()
+    query = f"SELECT pesid FROM imagem WHERE caminho_imagem LIKE '%{image_name}%'"
+    cursor.execute(query)
+    result = cursor.fetchone()
+    cursor.close()
+    connection.close()
+    return result[0] if result else None
 
-images_a, labels_a = load_images(directory_a)
-images_b, labels_b = load_images(directory_b)
+def insert_suspect(pesid, image_path):
+    connection = connect_db()
+    cursor = connection.cursor()
+    insert_query = "INSERT INTO solicitacao_suspeita (pesid, data, imagem) VALUES (%s, %s, %s)"
+    cursor.execute(insert_query, (pesid, datetime.now(), image_path))
+    connection.commit()
+    cursor.close()
+    connection.close()
 
-images_a = images_a.astype('float32') / 255.0
-images_b = images_b.astype('float32') / 255.0
+def preprocess_image(image_path):
+    # Carregar a imagem
+    img = cv2.imread(image_path)
+    detector = MTCNN()
 
-def create_model():
-    model = Sequential([
-        Conv2D(32, (3, 3), activation='relu', input_shape=(128, 128, 3)),
-        MaxPooling2D(pool_size=(2, 2)),
-        Conv2D(64, (3, 3), activation='relu'),
-        MaxPooling2D(pool_size=(2, 2)),
-        Flatten(),
-        Dense(128, activation='relu'),
-        Dropout(0.5),
-        Dense(1, activation='sigmoid')
-    ])
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-    return model
+    # Detectar rostos
+    result = detector.detect_faces(img)
+    if result:
+        # Extrair o rosto
+        x, y, w, h = result[0]['box']
+        face = img[y:y+h, x:x+w]
+        face = cv2.resize(face, (160, 160))  # Tamanho padrão para o FaceNet
+        face = face / 255.0  # Normalizar a imagem
+        return np.expand_dims(face, axis=0)  # Adicionar dimensão para batch
+    return None
 
-model = create_model()
-history = model.fit(images_a, np.ones(len(images_a)), epochs=10, validation_data=(images_b, np.zeros(len(images_b))))
+import tensorflow as tf
 
-epochs = history.epoch
-acc = history.history['accuracy']
-val_acc = history.history['val_accuracy']
-loss = history.history['loss']
-val_loss = history.history['val_loss']
+def create_siamese_model(input_shape):
+    base_model = tf.keras.models.load_model(r'C:\Users\vitor\PycharmProjects\tensorflow_facerecognition\keras-facenet\facenet_keras.h5')
 
-y_true = np.array([1] * len(images_a) + [0] * len(images_b))  # 1 para solicitantes, 0 para blacklist
-y_scores = model.predict(np.concatenate((images_a, images_b)), verbose=0)
+    def siamese_tower():
+        model = models.Sequential([
+            base_model,
+            layers.GlobalAveragePooling2D(),
+            layers.Dense(128, activation='sigmoid')  # Embeddings faciais compactos
+        ])
+        return model
 
-auc_roc = roc_auc_score(y_true, y_scores)
+    input_A = layers.Input(shape=input_shape)
+    input_B = layers.Input(shape=input_shape)
 
-plt.figure(figsize=(12, 5))
-plt.subplot(1, 2, 1)
-plt.plot(epochs, acc, label='Acurácia Treinamento')
-plt.plot(epochs, val_acc, label='Acurácia Validação')
-plt.title('Acurácia')
-plt.xlabel('Épocas')
-plt.ylabel('Acurácia')
+    tower_A = siamese_tower()(input_A)
+    tower_B = siamese_tower()(input_B)
+
+    # Distância Euclidiana entre os embeddings
+    distance = layers.Lambda(lambda tensors: K.sqrt(K.sum(K.square(tensors[0] - tensors[1]), axis=-1, keepdims=True)))([tower_A, tower_B])
+    outputs = layers.Dense(1, activation="sigmoid")(distance)
+
+    siamese_network = models.Model(inputs=[input_A, input_B], outputs=outputs)
+    return siamese_network
+
+
+model = create_siamese_model((112, 112, 3))
+
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+def generate_training_pairs(dir_A, dir_B):
+    positive_pairs = []
+    negative_pairs = []
+
+    images_A = os.listdir(dir_A)
+    images_B = os.listdir(dir_B)
+
+    # Gerar pares positivos (mesmo nome em ambas as pastas)
+    for img_A in images_A:
+        if img_A in images_B:
+            img_A_path = os.path.join(dir_A, img_A)
+            img_B_path = os.path.join(dir_B, img_A)
+            preprocessed_A = preprocess_image(img_A_path)
+            preprocessed_B = preprocess_image(img_B_path)
+            if preprocessed_A is not None and preprocessed_B is not None:
+                positive_pairs.append((preprocessed_A, preprocessed_B))
+
+    # Gerar pares negativos (imagens diferentes)
+    for img_A in images_A:
+        for img_B in images_B:
+            if img_A != img_B:
+                img_A_path = os.path.join(dir_A, img_A)
+                img_B_path = os.path.join(dir_B, img_B)
+                preprocessed_A = preprocess_image(img_A_path)
+                preprocessed_B = preprocess_image(img_B_path)
+                if preprocessed_A is not None and preprocessed_B is not None:
+                    negative_pairs.append((preprocessed_A, preprocessed_B))
+
+    pairs = positive_pairs + negative_pairs
+    labels = [1] * len(positive_pairs) + [0] * len(negative_pairs)
+
+    return pairs, labels
+
+
+def load_image_pairs(pairs):
+    images_A = []
+    images_B = []
+    for pair in pairs:
+        img_A = preprocess_image(pair[0])
+        img_B = preprocess_image(pair[1])
+        images_A.append(img_A)
+        images_B.append(img_B)
+
+    images_A = np.concatenate(images_A, axis=0)
+    images_B = np.concatenate(images_B, axis=0)
+
+    return images_A, images_B
+
+pairs, labels = generate_training_pairs(dir_A, dir_B)
+images_A, images_B = load_image_pairs(pairs)
+labels = np.array(labels)
+
+train_images_A, val_images_A, train_images_B, val_images_B, train_labels, val_labels = train_test_split(
+    images_A, images_B, labels, test_size=0.2, random_state=42
+)
+train_datagen = ImageDataGenerator(
+    rotation_range=20,         # Rotaciona a imagem até 20 graus
+    width_shift_range=0.2,     # Deslocamento horizontal
+    height_shift_range=0.2,    # Deslocamento vertical
+    shear_range=0.2,           # Cisalhamento
+    zoom_range=0.2,            # Zoom na imagem
+    horizontal_flip=True,      # Flip horizontal
+    fill_mode='nearest'        # Preenche com valores próximos
+)
+
+train_generator = train_datagen.flow([train_images_A, train_images_B], train_labels, batch_size=16)
+val_datagen = ImageDataGenerator(rescale=1./255)
+val_generator = val_datagen.flow([val_images_A, val_images_B], val_labels, batch_size=16)
+
+def data_generator(pairs, labels, batch_size):
+    while True:
+        for start in range(0, len(pairs), batch_size):
+            end = min(start + batch_size, len(pairs))
+            batch_pairs = pairs[start:end]
+            batch_labels = labels[start:end]
+
+            images_A = []
+            images_B = []
+            for pair in batch_pairs:
+                images_A.append(pair[0])
+                images_B.append(pair[1])
+
+            yield [np.array(images_A), np.array(images_B)], np.array(batch_labels)
+
+train_pairs, val_pairs, train_labels, val_labels = train_test_split(pairs, labels, test_size=0.2, random_state=42)
+train_generator = data_generator(train_pairs, train_labels, batch_size=16)
+val_generator = data_generator(val_pairs, val_labels, batch_size=16)
+
+history = model.fit(
+    train_generator,
+    validation_data=val_generator,
+    epochs=10,
+    steps_per_epoch=len(train_pairs) // 16,
+    validation_steps=len(val_pairs) // 16
+)
+
+
+plt.figure(figsize=(10, 6))
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Loss vs Epochs')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
 plt.legend()
-
-plt.subplot(1, 2, 2)
-plt.plot(epochs, loss, label='Perda Treinamento')
-plt.plot(epochs, val_loss, label='Perda Validação')
-plt.title('Perda')
-plt.xlabel('Épocas')
-plt.ylabel('Perda')
-plt.legend()
-
-plt.suptitle(f'AUC-ROC: {auc_roc:.4f}')
 plt.show()
 
+predictions = model.predict([images_A, images_B])
 
-def insert_into_db(pesid, image_path):
-    pesid_value = str(pesid)
-    image_path_value = str(image_path)  # Converte numpy.str_ para str
-    conn = mysql.connector.connect(**db_config)
-    cursor = conn.cursor()
+plt.figure(figsize=(10, 6))
+plt.plot(predictions, label='Predições do Modelo')
+plt.title('Predições de Similaridade')
+plt.xlabel('Índice da Amostra')
+plt.ylabel('Probabilidade de Similaridade')
+plt.legend()
+plt.show()
 
-    print(f'Tipo de pesid: {type(pesid_value)}')
-    print(f'Tipo de image_path: {type(image_path_value)}')  # Atualizado para verificar o tipo após a conversão
+def detect_frauds(model, dir_A, dir_B, threshold=0.5):
+    for img_A in os.listdir(dir_A):
+        img_A_path = os.path.join(dir_A, img_A)
+        img_A_array = preprocess_image(img_A_path)
 
-    # Formata a data
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        if img_A_array is not None:
+            for img_B in os.listdir(dir_B):
+                img_B_path = os.path.join(dir_B, img_B)
+                img_B_array = preprocess_image(img_B_path)
 
-    query = "INSERT INTO solicitacao_suspeita (pesid, data, imagem) VALUES (%s, %s, %s)"
+                if img_B_array is not None:
+                    # Fazer a predição da similaridade
+                    prediction = model.predict([img_A_array, img_B_array])[0][0]
 
-    try:
-        cursor.execute(query, (pesid_value, now, image_path_value))
-        conn.commit()
-        print("Dados inseridos com sucesso.")
-    except mysql.connector.Error as err:
-        print("Erro ao inserir dados:", err)
-    finally:
-        cursor.close()
-        conn.close()
+                    # Verificar se a similaridade é maior que o threshold
+                    if prediction > threshold:
+                        print(f"Correspondência detectada: {img_A} e {img_B} (Similaridade: {prediction:.2f})")
+                        pesid = get_pesid(img_A)
+                        if pesid:
+                            insert_suspect(pesid, img_A_path)
 
-
-for i, img in enumerate(images_a):
-    img_flat = img.reshape(1, 128, 128, 3)
-    prediction = model.predict(img_flat)
-    if prediction[0][0] > 0.5:
-        image_name = labels_a[i]
-        query = f"SELECT pesid FROM imagem WHERE caminho_imagem LIKE '%{image_name}%'"
-
-        conn = mysql.connector.connect(**db_config)
-        cursor = conn.cursor()
-        cursor.execute(query)
-        pesid = cursor.fetchone()
-
-        if pesid and pesid[0] is not None:
-            print(f'Pesid encontrado: {pesid[0]}')
-            insert_into_db(pesid[0], image_name)  # Não precisa de str() aqui, já está como string
-        cursor.close()
-        conn.close()
-
-print("Processo concluído.")
+detect_frauds(model, dir_A, dir_B)
